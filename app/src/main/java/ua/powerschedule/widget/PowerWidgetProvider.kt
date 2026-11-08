@@ -84,6 +84,9 @@ class PowerWidgetProvider : AppWidgetProvider() {
                 else -> "відключень не заплановано"
             }
             val selectedQueue = p.getString("queue", "6.1") ?: "6.1"
+            val sourceName = if (p.getString("source", "") == "energy-ua") "ENERGY-UA" else "ОБЛЕНЕРГО"
+            val emergency = savedDay == dayKey(now) && p.getBoolean("emergency", false)
+            val shownLabel = (if (emergency) "⚠ " else "") + label
             val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
             for ((cls, layout, compact) in targets) {
@@ -92,12 +95,12 @@ class PowerWidgetProvider : AppWidgetProvider() {
                 val bmp = drawTimeline(todayList, minute, loaded, compact)
                 ids.forEach { id ->
                     val rv = RemoteViews(c.packageName, layout)
-                    rv.setTextViewText(R.id.location, "ЧЕРГА $selectedQueue · ENERGY-UA")
+                    rv.setTextViewText(R.id.location, "ЧЕРГА $selectedQueue · $sourceName")
                     rv.setImageViewResource(R.id.status_icon, if (!loaded) R.drawable.ic_bulb_nodata else if (off) R.drawable.ic_bulb_off else R.drawable.ic_bulb_on)
                     rv.setContentDescription(R.id.status_icon, if (!loaded) "Немає даних" else if (off) "Немає світла" else "Є світло")
                     rv.setTextColor(R.id.countdown, if (!loaded) Color.rgb(200, 208, 214) else if (off) Color.rgb(240, 160, 164) else Color.rgb(185, 226, 201))
                     rv.setTextViewText(R.id.countdown, countdown)
-                    rv.setTextViewText(R.id.countdown_label, label)
+                    rv.setTextViewText(R.id.countdown_label, shownLabel)
                     rv.setImageViewBitmap(R.id.timeline, bmp)
                     rv.setOnClickPendingIntent(R.id.status_icon, open); rv.setOnClickPendingIntent(R.id.timeline, open)
                     mgr.updateAppWidget(id, rv)
