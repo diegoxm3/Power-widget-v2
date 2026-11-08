@@ -18,19 +18,12 @@ import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
 class PowerWidgetProvider : AppWidgetProvider() {
-    override fun onEnabled(context: Context) {
-        val req = PeriodicWorkRequestBuilder<ScheduleWorker>(15, TimeUnit.MINUTES).build()
-        WorkManager.getInstance(context).enqueueUniquePeriodicWork("schedule-refresh", ExistingPeriodicWorkPolicy.UPDATE, req)
-        scheduleTick(context)
-    }
-    override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
-        updateAll(context); scheduleTick(context)
-        WorkManager.getInstance(context).enqueue(OneTimeWorkRequestBuilder<ScheduleWorker>().build())
-    }
+    override fun onEnabled(context: Context) = start(context)
+    override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) = refresh(context)
     override fun onReceive(context: Context, intent: Intent) {
         super.onReceive(context, intent)
-        if (intent.action == ACTION_TICK || intent.action == ACTION_REFRESH) updateAll(context)
-        if (intent.action == ACTION_TICK) scheduleTick(context)
+        if (intent.action == ACTION_TICK) { if (updateAll(context)) scheduleTick(context) }
+        else if (intent.action == ACTION_REFRESH) updateAll(context)
     }
     companion object {
         const val ACTION_TICK = "ua.powerschedule.widget.TICK"
@@ -39,10 +32,25 @@ class PowerWidgetProvider : AppWidgetProvider() {
         fun dayKey(c: Calendar): String =
             String.format("%04d-%02d-%02d", c.get(Calendar.YEAR), c.get(Calendar.MONTH) + 1, c.get(Calendar.DAY_OF_MONTH))
 
-        fun updateAll(c: Context) {
+        fun start(context: Context) {
+            val req = PeriodicWorkRequestBuilder<ScheduleWorker>(15, TimeUnit.MINUTES).build()
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork("schedule-refresh", ExistingPeriodicWorkPolicy.UPDATE, req)
+            scheduleTick(context)
+        }
+
+        fun refresh(context: Context) {
+            updateAll(context); scheduleTick(context)
+            WorkManager.getInstance(context).enqueue(OneTimeWorkRequestBuilder<ScheduleWorker>().build())
+        }
+
+        /** Updates every placed widget of both sizes. Returns false when none are placed. */
+        fun updateAll(c: Context): Boolean {
             val mgr = AppWidgetManager.getInstance(c)
-            val ids = mgr.getAppWidgetIds(ComponentName(c, PowerWidgetProvider::class.java))
-            if (ids.isEmpty()) return
+            val targets = listOf(
+                Triple(PowerWidgetProvider::class.java, R.layout.widget_power, true),
+                Triple(PowerWidgetBigProvider::class.java, R.layout.widget_power_big, false)
+            )
+            if (targets.all { mgr.getAppWidgetIds(ComponentName(c, it.first)).isEmpty() }) return false
             val p = c.getSharedPreferences("schedule", Context.MODE_PRIVATE)
             val now = Calendar.getInstance()
             val minute = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
@@ -75,21 +83,27 @@ class PowerWidgetProvider : AppWidgetProvider() {
                 tomorrow == null -> "на сьогодні більше немає"
                 else -> "відключень не заплановано"
             }
-            val bmp = drawTimeline(todayList, minute, loaded)
             val selectedQueue = p.getString("queue", "6.1") ?: "6.1"
-            ids.forEach { id ->
-                val rv = RemoteViews(c.packageName, R.layout.widget_power)
-                rv.setTextViewText(R.id.location, "ЧЕРГА $selectedQueue · ENERGY-UA")
-                rv.setImageViewResource(R.id.status_icon, if (!loaded) R.drawable.ic_bulb_nodata else if (off) R.drawable.ic_bulb_off else R.drawable.ic_bulb_on)
-                rv.setContentDescription(R.id.status_icon, if (!loaded) "Немає даних" else if (off) "Немає світла" else "Є світло")
-                rv.setTextColor(R.id.countdown, if (!loaded) Color.rgb(200, 208, 214) else if (off) Color.rgb(240, 160, 164) else Color.rgb(185, 226, 201))
-                rv.setTextViewText(R.id.countdown, countdown)
-                rv.setTextViewText(R.id.countdown_label, label)
-                rv.setImageViewBitmap(R.id.timeline, bmp)
-                val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-                rv.setOnClickPendingIntent(R.id.status_icon, open); rv.setOnClickPendingIntent(R.id.timeline, open)
-                mgr.updateAppWidget(id, rv)
+            val open = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+            for ((cls, layout, compact) in targets) {
+                val ids = mgr.getAppWidgetIds(ComponentName(c, cls))
+                if (ids.isEmpty()) continue
+                val bmp = drawTimeline(todayList, minute, loaded, compact)
+                ids.forEach { id ->
+                    val rv = RemoteViews(c.packageName, layout)
+                    rv.setTextViewText(R.id.location, "ЧЕРГА $selectedQueue · ENERGY-UA")
+                    rv.setImageViewResource(R.id.status_icon, if (!loaded) R.drawable.ic_bulb_nodata else if (off) R.drawable.ic_bulb_off else R.drawable.ic_bulb_on)
+                    rv.setContentDescription(R.id.status_icon, if (!loaded) "Немає даних" else if (off) "Немає світла" else "Є світло")
+                    rv.setTextColor(R.id.countdown, if (!loaded) Color.rgb(200, 208, 214) else if (off) Color.rgb(240, 160, 164) else Color.rgb(185, 226, 201))
+                    rv.setTextViewText(R.id.countdown, countdown)
+                    rv.setTextViewText(R.id.countdown_label, label)
+                    rv.setImageViewBitmap(R.id.timeline, bmp)
+                    rv.setOnClickPendingIntent(R.id.status_icon, open); rv.setOnClickPendingIntent(R.id.timeline, open)
+                    mgr.updateAppWidget(id, rv)
+                }
             }
+            return true
         }
 
         private data class Period(val first: Int, val second: Int)
@@ -119,14 +133,14 @@ class PowerWidgetProvider : AppWidgetProvider() {
 
         private fun fmt(m: Int) = (if (m >= 1440) "завтра " else "") + String.format("%02d:%02d", (m / 60) % 24, m % 60)
 
-        private fun drawTimeline(periods: List<Period>, minute: Int, loaded: Boolean): Bitmap {
-            // 1200x144 matches the aspect ratio of a ~385dp x 46dp bar (full-width widget), so shapes are not stretched.
+        private fun drawTimeline(periods: List<Period>, minute: Int, loaded: Boolean, compact: Boolean): Bitmap {
+            // 1200x144 matches the bar aspect ratio of both layouts (~200dp x 24dp in 5x1, ~385dp x 46dp in 5x2), so shapes are not stretched.
             val w = 1200; val h = 144
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             val cv = Canvas(bmp)
             val p = Paint(Paint.ANTI_ALIAS_FLAG)
             val left = 12f; val right = w - 12f
-            val top = 26f; val bottom = 118f
+            val top = if (compact) 20f else 26f; val bottom = if (compact) 124f else 118f
             val radius = (bottom - top) / 2f
             val track = RectF(left, top, right, bottom)
             p.color = Color.argb(235, 48, 60, 65)
@@ -158,7 +172,7 @@ class PowerWidgetProvider : AppWidgetProvider() {
             p.style = Paint.Style.FILL
 
             val x = left + (right - left) * minute.coerceIn(0, 1440) / 1440f
-            val marker = RectF(x - 5f, 6f, x + 5f, 138f)
+            val marker = RectF(x - 5f, if (compact) 4f else 6f, x + 5f, if (compact) 140f else 138f)
             p.color = Color.rgb(235, 199, 112)
             cv.drawRoundRect(marker, 5f, 5f, p)
             p.style = Paint.Style.STROKE
