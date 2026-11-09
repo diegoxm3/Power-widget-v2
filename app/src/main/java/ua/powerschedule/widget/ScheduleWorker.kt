@@ -14,34 +14,80 @@ class ScheduleWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
     /** Periods are stored as "З HH:MM до HH:MM. ..." text, which PowerWidgetProvider.parse() understands. */
     private class Fetched(val today: String?, val tomorrow: String?, val updateTomorrow: Boolean, val emergency: Boolean, val source: String)
 
-    override suspend fun doWork(): Result = try {
-        val prefs = applicationContext.getSharedPreferences("schedule", Context.MODE_PRIVATE)
+    private var alertsError: String = ""
+
+    override suspend fun doWork(): Result = try { refresh() } catch (_: Exception) { Result.retry() }
+
+    private fun refresh(): Result {
+        val ctx = applicationContext
+        val prefs = ctx.getSharedPreferences("schedule", Context.MODE_PRIVATE)
         val queue = prefs.getString("queue", "6.1") ?: "6.1"
+        val force = inputData.getBoolean("force", false)
+        val nowMs = System.currentTimeMillis()
+
+        // Be polite to the source: at most one fetch per 5 minutes unless the person pressed the save button.
+        if (!force && nowMs - prefs.getLong("last_attempt", 0L) < 5 * 60_000L) {
+            PowerWidgetProvider.updateAll(ctx)
+            return Result.success()
+        }
+        prefs.edit().putLong("last_attempt", nowMs).apply()
+
         val cal = Calendar.getInstance()
         val todayKey = PowerWidgetProvider.dayKey(cal)
+        val yesterdayKey = PowerWidgetProvider.dayKey((cal.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, -1) })
+        val savedDay = prefs.getString("day", "") ?: ""
+        val sameQueue = prefs.getString("fetched_queue", "") == queue
+        val haveSaved = sameQueue &&
+            ((savedDay == todayKey && prefs.getBoolean("today_ok", false)) ||
+                (savedDay == yesterdayKey && prefs.getBoolean("tomorrow_ok", false)))
+        val clock = String.format("%02d:%02d", cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))
 
-        // Primary source: alerts.energy (Poltavaoblenergo, per queue). Fallback: Energy-UA.
-        val fetched = fromAlerts(queue, cal) ?: fromEnergyUa(queue)
+        val alerts = fromAlerts(queue, cal)
+        val fetched: Fetched
+        val status: String
+        if (alerts != null) {
+            fetched = alerts
+            status = "Оновлено $clock · alerts.energy"
+        } else {
+            val fb = try { fromEnergyUa(queue) } catch (_: Exception) { null }
+            val fbHasData = fb?.today?.let { Regex("\\d{2}:\\d{2}").containsMatchIn(it) } == true
+            if (fb != null && (fbHasData || !haveSaved)) {
+                fetched = fb
+                status = "$clock · alerts.energy: $alertsError. Взято Energy-UA"
+            } else {
+                // Do not replace good saved data with an empty fallback.
+                prefs.edit().putString("status", "$clock · alerts.energy: $alertsError. Показано збережене").apply()
+                PowerWidgetProvider.updateAll(ctx)
+                return Result.success()
+            }
+        }
 
         val ed = prefs.edit()
             .putString("today", fetched.today ?: "").putBoolean("today_ok", fetched.today != null)
         // A failed tomorrow request must not wipe tomorrow's schedule that was already saved today.
-        if (fetched.updateTomorrow || (prefs.getString("day", "") ?: "") != todayKey) {
+        if (fetched.updateTomorrow || savedDay != todayKey || !sameQueue) {
             ed.putString("tomorrow", fetched.tomorrow ?: "").putBoolean("tomorrow_ok", fetched.tomorrow != null)
         }
         ed.putBoolean("emergency", fetched.emergency)
             .putString("source", fetched.source)
+            .putString("fetched_queue", queue)
+            .putString("status", status)
             .putString("day", todayKey)
-            .putLong("updated", System.currentTimeMillis()).apply()
-        PowerWidgetProvider.updateAll(applicationContext)
-        Result.success()
-    } catch (_: Exception) { Result.retry() }
+            .putLong("updated", nowMs).apply()
+        PowerWidgetProvider.updateAll(ctx)
+        return Result.success()
+    }
 
     private fun fromAlerts(queue: String, cal: Calendar): Fetched? {
         val base = "https://alerts.energy/poltavska-oblast/schedule/poltavska_oblast_oblenergo/$queue"
-        val todayHtml = (try { download(base) } catch (_: Exception) { null }) ?: return null
+        val todayHtml = try { download(base) } catch (e: Exception) {
+            alertsError = e.message ?: e.javaClass.simpleName
+            return null
+        }
+        if (todayHtml == null) { alertsError = "HTTP 404"; return null }
         val todayText = Jsoup.parse(todayHtml).text()
-        val today = alertsPeriods(todayText, dateWords(cal, 0)) ?: return null
+        val today = alertsPeriods(todayText, dateWords(cal, 0))
+        if (today == null) { alertsError = "сторінка без графіка на сьогодні"; return null }
 
         var tomorrow: String? = null
         var updateTomorrow = true
@@ -95,7 +141,9 @@ class ScheduleWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
             setRequestProperty("Accept-Language", "uk")
         }
         try {
-            if (conn.responseCode == 404) return null
+            val code = conn.responseCode
+            if (code == 404) return null
+            if (code != 200) throw java.io.IOException("HTTP $code")
             return conn.inputStream.bufferedReader().use { it.readText() }
         } finally {
             conn.disconnect()

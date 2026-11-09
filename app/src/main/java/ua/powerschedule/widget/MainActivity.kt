@@ -4,13 +4,23 @@ import android.app.Activity
 import android.os.Bundle
 import android.view.Gravity
 import android.widget.*
+import androidx.work.Data
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 
 class MainActivity : Activity() {
+    private var statusView: TextView? = null
+    private lateinit var prefsRef: android.content.SharedPreferences
+
+    override fun onResume() {
+        super.onResume()
+        statusView?.text = prefsRef.getString("status", "Ще не оновлювалось")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences("schedule", MODE_PRIVATE)
+        prefsRef = prefs
         val queues = (1..6).flatMap { q -> (1..2).map { sub -> "$q.$sub" } }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -38,7 +48,9 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val selected = spinner.selectedItem.toString()
                 prefs.edit().putString("queue", selected).apply()
-                WorkManager.getInstance(this@MainActivity).enqueue(OneTimeWorkRequestBuilder<ScheduleWorker>().build())
+                val forced = OneTimeWorkRequestBuilder<ScheduleWorker>()
+                    .setInputData(Data.Builder().putBoolean("force", true).build()).build()
+                WorkManager.getInstance(this@MainActivity).enqueue(forced)
                 Toast.makeText(this@MainActivity, "Обрано чергу $selected", Toast.LENGTH_SHORT).show()
                 PowerWidgetProvider.updateAll(this@MainActivity)
             }
@@ -47,6 +59,12 @@ class MainActivity : Activity() {
             text = "Віджет оновлюватиме графік автоматично. Натисніть «Зберегти та оновити» після зміни черги."
             textSize = 14f
         })
+        statusView = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, 24, 0, 0)
+            text = prefs.getString("status", "Ще не оновлювалось")
+        }
+        root.addView(statusView)
         setContentView(root)
         WorkManager.getInstance(this).enqueue(OneTimeWorkRequestBuilder<ScheduleWorker>().build())
     }
